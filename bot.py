@@ -1,7 +1,6 @@
 import os
-import time
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 import pytz
 from fastapi import FastAPI
@@ -12,11 +11,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
-THREAD_ID = os.getenv("THREAD_ID", "").strip()  # opcional
+THREAD_ID = os.getenv("THREAD_ID", "").strip()  # opcional (topics)
 
 TZ = pytz.timezone("Europe/Zurich")
 
-app = FastAPI(title="Telegram Bot Scheduler")
+app = FastAPI(title="Telegram Market Bot")
+scheduler = BackgroundScheduler(timezone=TZ)
 
 
 # ======================
@@ -34,7 +34,7 @@ def get_binance_btc_24h():
 
 
 def get_binance_funding_and_oi():
-    # Funding (lastFundingRate) + markPrice
+    # Funding + markPrice
     purl = "https://fapi.binance.com/fapi/v1/premiumIndex"
     pr = requests.get(purl, params={"symbol": "BTCUSDT"}, timeout=20)
     pr.raise_for_status()
@@ -52,7 +52,7 @@ def get_binance_funding_and_oi():
 
 
 def get_binance_trend_ema():
-    # Trend simple: EMA50 vs EMA200 en 1H (lectura rápida)
+    # Trend simple: EMA50 vs EMA200 en 1H
     url = "https://api.binance.com/api/v3/klines"
     r = requests.get(url, params={"symbol": "BTCUSDT", "interval": "1h", "limit": 220}, timeout=20)
     r.raise_for_status()
@@ -66,8 +66,10 @@ def get_binance_trend_ema():
             e = v * k + e * (1 - k)
         return e
 
-    ema50 = ema(closes[-200:], 50)
-    ema200 = ema(closes[-200:], 200)
+    # usamos últimos 200 para estabilidad
+    series = closes[-200:]
+    ema50 = ema(series, 50)
+    ema200 = ema(series, 200)
     last = closes[-1]
 
     if ema50 > ema200 and last > ema50:
@@ -100,7 +102,6 @@ def get_dominance_btc_usdt():
     btc_dom = float(gj["market_cap_percentage"].get("btc", 0.0))
     total_mcap = float(gj["total_market_cap"].get("usd", 0.0))
 
-    # USDT market cap
     m = requests.get(
         "https://api.coingecko.com/api/v3/coins/markets",
         params={"vs_currency": "usd", "ids": "tether"},
@@ -113,8 +114,8 @@ def get_dominance_btc_usdt():
     return btc_dom, usdt_dom
 
 
-def pct_arrow(x: float) -> str:
-    return "↑" if x > 0 else ("↓" if x < 0 else "→")
+def arrow(pct: float) -> str:
+    return "↑" if pct > 0 else ("↓" if pct < 0 else "→")
 
 
 # ======================
@@ -122,7 +123,7 @@ def pct_arrow(x: float) -> str:
 # ======================
 def send_telegram_message(text: str):
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Faltan variables BOT_TOKEN o CHAT_ID")
+        raise RuntimeError("Faltan variables BOT_TOKEN o CHAT_ID en Railway")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -131,7 +132,6 @@ def send_telegram_message(text: str):
         "disable_web_page_preview": True,
     }
     if THREAD_ID:
-        # Topics (forums)
         payload["message_thread_id"] = int(THREAD_ID)
 
     r = requests.post(url, json=payload, timeout=20)
@@ -139,7 +139,6 @@ def send_telegram_message(text: str):
 
 
 def build_report():
-    # Datos
     price, chg_pct, vol_usdt = get_binance_btc_24h()
     funding, mark, oi = get_binance_funding_and_oi()
     trend, ema50, ema200 = get_binance_trend_ema()
@@ -148,10 +147,10 @@ def build_report():
 
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
 
-    # Formato
+    # Mensaje sin emojis raros (solo lo normal)
     text = (
-        f"🧠 Contexto de Mercado — {now} (Suiza)\n\n"
-        f"BTC: ${price:,.0f}  ({pct_arrow(chg_pct)} {chg_pct:.2f}% 24h)\n"
+        f"Contexto de Mercado — {now} (Suiza)\n\n"
+        f"BTC: ${price:,.0f} ({arrow(chg_pct)} {chg_pct:.2f}% 24h)\n"
         f"Volumen 24h (USDT): {vol_usdt:,.0f}\n\n"
         f"Tendencia (1H EMA50/200): {trend}\n"
         f"EMA50: {ema50:,.0f} | EMA200: {ema200:,.0f}\n\n"
@@ -169,26 +168,23 @@ def job_send():
     try:
         msg = build_report()
         send_telegram_message(msg)
+        print("Sent Telegram report OK", flush=True)
     except Exception as e:
-        # Log mínimo para Railway
         print("ERROR job_send:", repr(e), flush=True)
 
 
 # ======================
 # Scheduler
 # ======================
-scheduler = BackgroundScheduler(timezone=TZ)
-
-
 @app.on_event("startup")
 def startup_event():
-    # 01:00 Suiza (Tokyo open aprox en tu referencia)
+    # 01:00 Suiza (Tokio en tu referencia)
     scheduler.add_job(job_send, "cron", hour=1, minute=0, id="tokyo_1am", replace_existing=True)
-    # 09:00 Suiza (London open en tu referencia)
+    # 09:00 Suiza (Londres en tu referencia)
     scheduler.add_job(job_send, "cron", hour=9, minute=0, id="london_9am", replace_existing=True)
 
     scheduler.start()
-    print("Scheduler started. Jobs: tokyo_1am (01:00), london_9am (09:00)", flush=True)
+    print("Scheduler started: 01:00 (Tokio), 09:00 (Londres) Europe/Zurich", flush=True)
 
 
 @app.get("/")
