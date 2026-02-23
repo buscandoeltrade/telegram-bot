@@ -16,9 +16,13 @@ THREAD_ID = os.getenv("THREAD_ID", "").strip()  # opcional (topics)
 TZ = pytz.timezone("Europe/Zurich")
 app = FastAPI(title="Telegram Market Bot")
 
+
 # ======================
-# Helpers
+# Utils
 # ======================
+def log(msg: str):
+    print(msg, flush=True)
+
 def safe_float(x, default=None):
     try:
         return float(x)
@@ -38,115 +42,210 @@ def fmt_pct(x: float, decimals=2):
         return "No disponible"
     return f"{x:.{decimals}f}%"
 
+
 # ======================
-# Data Sources (FREE)
+# HTTP helper
 # ======================
-def get_bybit_ticker_24h():
-    # Precio + %24h + volumen 24h (turnover USD)
-    url = "https://api.bybit.com/v5/market/tickers"
-    r = requests.get(url, params={"category": "linear", "symbol": "BTCUSDT"}, timeout=20)
+def get_json(url, params=None):
+    r = requests.get(url, params=params or {}, timeout=25, headers={
+        "User-Agent": "Mozilla/5.0"
+    })
     r.raise_for_status()
-    j = r.json()
-    item = j["result"]["list"][0]
-    last = safe_float(item.get("lastPrice"))
-    chg_pct = safe_float(item.get("price24hPcnt"))
-    # bybit devuelve 0.0123 = 1.23%
-    chg_pct = (chg_pct * 100) if chg_pct is not None else None
-    turnover = safe_float(item.get("turnover24h"))  # en USD aprox
-    return last, chg_pct, turnover
+    return r.json()
 
-def get_bybit_funding_and_oi():
-    # Funding rate
-    f_url = "https://api.bybit.com/v5/market/funding/history"
-    fr = requests.get(
-        f_url,
-        params={"category": "linear", "symbol": "BTCUSDT", "limit": 1},
-        timeout=20,
-    )
-    fr.raise_for_status()
-    fj = fr.json()
-    f_list = fj.get("result", {}).get("list", [])
-    funding = safe_float(f_list[0].get("fundingRate")) if f_list else None  # ej: 0.0001
-    funding = (funding * 100) if funding is not None else None
 
-    # Open interest
-    oi_url = "https://api.bybit.com/v5/market/open-interest"
-    oir = requests.get(
-        oi_url,
-        params={"category": "linear", "symbol": "BTCUSDT", "intervalTime": "5min", "limit": 1},
-        timeout=20,
-    )
-    oir.raise_for_status()
-    oij = oir.json()
-    oi_list = oij.get("result", {}).get("list", [])
-    oi = safe_float(oi_list[0].get("openInterest")) if oi_list else None
+# ======================
+# DATA: Ticker 24h (Bybit) con fallback OKX
+# ======================
+def get_ticker_24h():
+    # --- Bybit ---
+    try:
+        url = "https://api.bybit.com/v5/market/tickers"
+        j = get_json(url, {"category": "linear", "symbol": "BTCUSDT"})
+        if j.get("retCode", 0) != 0:
+            raise RuntimeError(f"Bybit ticker retCode={j.get('retCode')} retMsg={j.get('retMsg')}")
+        item = j["result"]["list"][0]
+        last = safe_float(item.get("lastPrice"))
+        chg_pct = safe_float(item.get("price24hPcnt"))
+        chg_pct = (chg_pct * 100) if chg_pct is not None else None
+        turnover = safe_float(item.get("turnover24h"))  # USD aprox
+        return last, chg_pct, turnover, "Bybit"
+    except Exception as e:
+        log(f"[WARN] Bybit ticker failed: {repr(e)}")
 
-    return funding, oi
+    # --- OKX fallback ---
+    try:
+        url = "https://www.okx.com/api/v5/market/ticker"
+        j = get_json(url, {"instId": "BTC-USDT"})
+        data = j.get("data", [])
+        if not data:
+            raise RuntimeError("OKX ticker empty data")
+        item = data[0]
+        last = safe_float(item.get("last"))
+        # OKX no da %24h directo en este endpoint; calculamos con open/last
+        open_24 = safe_float(item.get("open24h"))
+        chg_pct = None
+        if last is not None and open_24 not in (None, 0):
+            chg_pct = (last - open_24) / open_24 * 100
+        vol_ccy_24 = safe_float(item.get("volCcy24h"))  # en USDT aprox para BTC-USDT
+        return last, chg_pct, vol_ccy_24, "OKX"
+    except Exception as e:
+        log(f"[WARN] OKX ticker failed: {repr(e)}")
 
-def get_bybit_liquidations_24h():
-    # Suma liquidaciones long + short de las últimas 24h (Bybit)
-    # OJO: Bybit da “qty” por evento; lo convertimos a USD aprox con precio del momento si viene.
-    url = "https://api.bybit.com/v5/market/liquidation"
-    r = requests.get(
-        url,
-        params={"category": "linear", "symbol": "BTCUSDT", "limit": 200},
-        timeout=20,
-    )
-    r.raise_for_status()
-    j = r.json()
-    events = j.get("result", {}).get("list", [])
-    if not events:
-        return None
+    return None, None, None, "N/A"
 
-    now_ts = int(datetime.now(tz=TZ).timestamp() * 1000)
-    day_ms = 24 * 60 * 60 * 1000
 
-    total_usd = 0.0
-    used_any = False
+# ======================
+# DATA: Funding + OI (Bybit) con fallback OKX
+# ======================
+def get_funding_and_oi():
+    funding = None
+    oi = None
+    source = "N/A"
 
-    for e in events:
-        ts = int(e.get("time", 0))
-        if now_ts - ts > day_ms:
-            continue
-        qty = safe_float(e.get("qty"))
-        price = safe_float(e.get("price"))
-        if qty is None:
-            continue
-        # Si hay price, hacemos qty*price ~ USD
-        if price is not None:
-            total_usd += qty * price
-            used_any = True
+    # --- Bybit ---
+    try:
+        # Funding
+        f_url = "https://api.bybit.com/v5/market/funding/history"
+        fj = get_json(f_url, {"category": "linear", "symbol": "BTCUSDT", "limit": 1})
+        if fj.get("retCode", 0) != 0:
+            raise RuntimeError(f"Bybit funding retCode={fj.get('retCode')} retMsg={fj.get('retMsg')}")
+        f_list = fj.get("result", {}).get("list", [])
+        if f_list:
+            fr = safe_float(f_list[0].get("fundingRate"))
+            funding = (fr * 100) if fr is not None else None
 
-    return total_usd if used_any else None
+        # OI
+        oi_url = "https://api.bybit.com/v5/market/open-interest"
+        oij = get_json(oi_url, {"category": "linear", "symbol": "BTCUSDT", "intervalTime": "5min", "limit": 1})
+        if oij.get("retCode", 0) != 0:
+            raise RuntimeError(f"Bybit OI retCode={oij.get('retCode')} retMsg={oij.get('retMsg')}")
+        oi_list = oij.get("result", {}).get("list", [])
+        if oi_list:
+            oi = safe_float(oi_list[0].get("openInterest"))
+
+        if funding is not None or oi is not None:
+            source = "Bybit"
+            return funding, oi, source
+
+        log("[WARN] Bybit funding/OI returned empty list(s).")
+    except Exception as e:
+        log(f"[WARN] Bybit funding/OI failed: {repr(e)}")
+
+    # --- OKX fallback ---
+    try:
+        # Funding rate OKX (swap)
+        f_url = "https://www.okx.com/api/v5/public/funding-rate"
+        fj = get_json(f_url, {"instId": "BTC-USDT-SWAP"})
+        data = fj.get("data", [])
+        if data:
+            fr = safe_float(data[0].get("fundingRate"))
+            funding = (fr * 100) if fr is not None else None
+
+        # OI OKX
+        oi_url = "https://www.okx.com/api/v5/public/open-interest"
+        oij = get_json(oi_url, {"instId": "BTC-USDT-SWAP"})
+        data = oij.get("data", [])
+        if data:
+            # OKX a veces trae varios; tomamos el primero
+            oi = safe_float(data[0].get("oi"))
+
+        source = "OKX"
+        return funding, oi, source
+    except Exception as e:
+        log(f"[WARN] OKX funding/OI failed: {repr(e)}")
+
+    return None, None, "N/A"
+
+
+# ======================
+# DATA: Liquidaciones 24h (OKX) primero, Bybit fallback
+# (Porque OKX suele darlo más fácil desde hosting)
+# ======================
+def get_liquidations_24h_usd():
+    # --- OKX ---
+    try:
+        url = "https://www.okx.com/api/v5/public/liquidation-orders"
+        j = get_json(url, {"instId": "BTC-USDT-SWAP", "limit": 100})
+        data = j.get("data", [])
+        if not data:
+            log("[WARN] OKX liquidations empty.")
+        else:
+            now_ms = int(datetime.now(tz=TZ).timestamp() * 1000)
+            day_ms = 24 * 60 * 60 * 1000
+            total = 0.0
+            used = False
+            for e in data:
+                ts = int(e.get("ts", 0))
+                if now_ms - ts > day_ms:
+                    continue
+                # OKX trae "sz" (size) y a veces "bkPx" o "px"
+                sz = safe_float(e.get("sz"))
+                px = safe_float(e.get("bkPx")) or safe_float(e.get("px"))
+                if sz is None or px is None:
+                    continue
+                total += sz * px
+                used = True
+            if used:
+                return total, "OKX"
+    except Exception as e:
+        log(f"[WARN] OKX liquidations failed: {repr(e)}")
+
+    # --- Bybit fallback ---
+    try:
+        url = "https://api.bybit.com/v5/market/liquidation"
+        j = get_json(url, {"category": "linear", "symbol": "BTCUSDT", "limit": 200})
+        if j.get("retCode", 0) != 0:
+            raise RuntimeError(f"Bybit liquidation retCode={j.get('retCode')} retMsg={j.get('retMsg')}")
+        events = j.get("result", {}).get("list", [])
+        if not events:
+            log("[WARN] Bybit liquidations empty.")
+            return None, "Bybit"
+
+        now_ts = int(datetime.now(tz=TZ).timestamp() * 1000)
+        day_ms = 24 * 60 * 60 * 1000
+        total = 0.0
+        used = False
+
+        for e in events:
+            ts = int(e.get("time", 0))
+            if now_ts - ts > day_ms:
+                continue
+            qty = safe_float(e.get("qty"))
+            price = safe_float(e.get("price"))
+            if qty is None or price is None:
+                continue
+            total += qty * price
+            used = True
+
+        return (total if used else None), "Bybit"
+    except Exception as e:
+        log(f"[WARN] Bybit liquidations failed: {repr(e)}")
+
+    return None, "N/A"
+
 
 def get_fear_greed():
     url = "https://api.alternative.me/fng/"
-    r = requests.get(url, params={"limit": 1, "format": "json"}, timeout=20)
-    r.raise_for_status()
-    j = r.json()
+    j = get_json(url, {"limit": 1, "format": "json"})
     data = j["data"][0]
-    value = int(data["value"])
-    cls = data["value_classification"]
-    return value, cls
+    return int(data["value"]), data["value_classification"]
+
 
 def get_dominance_btc_usdt():
-    g = requests.get("https://api.coingecko.com/api/v3/global", timeout=20)
-    g.raise_for_status()
-    gj = g.json()["data"]
-
+    g = get_json("https://api.coingecko.com/api/v3/global")
+    gj = g["data"]
     btc_dom = float(gj["market_cap_percentage"].get("btc", 0.0))
     total_mcap = float(gj["total_market_cap"].get("usd", 0.0))
 
-    m = requests.get(
+    m = get_json(
         "https://api.coingecko.com/api/v3/coins/markets",
-        params={"vs_currency": "usd", "ids": "tether"},
-        timeout=20,
+        {"vs_currency": "usd", "ids": "tether"},
     )
-    m.raise_for_status()
-    usdt_mcap = float(m.json()[0].get("market_cap", 0.0))
-
+    usdt_mcap = float(m[0].get("market_cap", 0.0))
     usdt_dom = (usdt_mcap / total_mcap * 100) if total_mcap > 0 else 0.0
     return btc_dom, usdt_dom
+
 
 # ======================
 # Telegram
@@ -156,27 +255,20 @@ def send_telegram_message(text: str):
         raise RuntimeError("Faltan variables BOT_TOKEN o CHAT_ID")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
     if THREAD_ID:
         payload["message_thread_id"] = int(THREAD_ID)
 
     r = requests.post(url, json=payload, timeout=20)
     r.raise_for_status()
 
-# ======================
-# Report + Bias
-# ======================
-def build_bias(chg_pct, funding, oi, fng_val, btc_dom, usdt_dom):
-    # Regla simple pero útil:
-    # - Fear extremo + rojo 24h suele ser contrarian alcista (rebote)
-    # - Funding muy positivo + OI alto suele ser riesgo de squeeze bajista
-    # - USDT.D alto suele pesar en risk-on
 
+# ======================
+# Bias
+# ======================
+def build_bias(chg_pct, funding, fng_val, usdt_dom):
     notes = []
+    score = 0
 
     if chg_pct is not None:
         notes.append("BTC 24h en rojo" if chg_pct < 0 else "BTC 24h en verde")
@@ -184,31 +276,23 @@ def build_bias(chg_pct, funding, oi, fng_val, btc_dom, usdt_dom):
     if fng_val is not None:
         if fng_val <= 10:
             notes.append("Fear extremo (contrarian alcista)")
+            if chg_pct is not None and chg_pct < 0:
+                score += 1
         elif fng_val >= 75:
             notes.append("Greed alto (riesgo pullback)")
+            score -= 1
 
     if funding is not None:
         if funding > 0.02:
-            notes.append("Funding alto (posible squeeze bajista)")
+            notes.append("Funding alto (riesgo squeeze bajista)")
+            score -= 1
         elif funding < -0.02:
-            notes.append("Funding negativo (posible squeeze alcista)")
+            notes.append("Funding negativo (riesgo squeeze alcista)")
+            score += 1
 
     if usdt_dom is not None and usdt_dom > 7.5:
         notes.append("USDT.D elevado (presión risk-off)")
-
-    # Determinar sesgo
-    score = 0
-    # contrarian
-    if fng_val is not None and fng_val <= 10 and chg_pct is not None and chg_pct < 0:
-        score += 1
-    # risk-off
-    if usdt_dom is not None and usdt_dom > 7.5:
         score -= 1
-    # funding squeeze risk
-    if funding is not None and funding > 0.02:
-        score -= 1
-    if funding is not None and funding < -0.02:
-        score += 1
 
     if score >= 1:
         bias = "Leve Alcista"
@@ -219,17 +303,24 @@ def build_bias(chg_pct, funding, oi, fng_val, btc_dom, usdt_dom):
 
     return bias, "; ".join(notes) if notes else "Sin suficientes señales"
 
+
+# ======================
+# Report
+# ======================
 def build_report():
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M (Suiza)")
 
-    price, chg_pct, vol_usd = get_bybit_ticker_24h()
-    funding, oi = get_bybit_funding_and_oi()
-    liq_24h = get_bybit_liquidations_24h()
+    price, chg_pct, vol_usd, ticker_src = get_ticker_24h()
+    funding, oi, fo_src = get_funding_and_oi()
+    liq_24h, liq_src = get_liquidations_24h_usd()
 
     btc_dom, usdt_dom = get_dominance_btc_usdt()
     fng_val, fng_cls = get_fear_greed()
 
-    bias, why = build_bias(chg_pct, funding, oi, fng_val, btc_dom, usdt_dom)
+    bias, why = build_bias(chg_pct, funding, fng_val, usdt_dom)
+
+    # Logs de qué fuente se usó
+    log(f"[INFO] Ticker source: {ticker_src} | Funding/OI source: {fo_src} | Liq source: {liq_src}")
 
     text = (
         f"Contexto de Mercado — {now}\n\n"
@@ -245,12 +336,14 @@ def build_report():
     )
     return text
 
+
 def job_send():
     try:
         msg = build_report()
         send_telegram_message(msg)
     except Exception as e:
-        print("ERROR job_send:", repr(e), flush=True)
+        log("ERROR job_send: " + repr(e))
+
 
 # ======================
 # Scheduler
@@ -259,13 +352,10 @@ scheduler = BackgroundScheduler(timezone=TZ)
 
 @app.on_event("startup")
 def startup_event():
-    # 01:00 Suiza (Tokyo open - como lo quieres)
     scheduler.add_job(job_send, "cron", hour=1, minute=0, id="tokyo_1am", replace_existing=True)
-    # 09:00 Suiza (London open - como lo quieres)
     scheduler.add_job(job_send, "cron", hour=9, minute=0, id="london_9am", replace_existing=True)
-
     scheduler.start()
-    print("Scheduler started: 01:00 (Tokio), 09:00 (Londres) Europe/Zurich", flush=True)
+    log("Scheduler started: 01:00 (Tokio), 09:00 (Londres) Europe/Zurich")
 
 @app.get("/")
 def root():
