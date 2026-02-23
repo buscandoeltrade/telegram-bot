@@ -47,9 +47,12 @@ def fmt_pct(x: float, decimals=2):
 # HTTP helper
 # ======================
 def get_json(url, params=None):
-    r = requests.get(url, params=params or {}, timeout=25, headers={
-        "User-Agent": "Mozilla/5.0"
-    })
+    r = requests.get(
+        url,
+        params=params or {},
+        timeout=25,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
     r.raise_for_status()
     return r.json()
 
@@ -82,7 +85,6 @@ def get_ticker_24h():
             raise RuntimeError("OKX ticker empty data")
         item = data[0]
         last = safe_float(item.get("last"))
-        # OKX no da %24h directo en este endpoint; calculamos con open/last
         open_24 = safe_float(item.get("open24h"))
         chg_pct = None
         if last is not None and open_24 not in (None, 0):
@@ -147,7 +149,6 @@ def get_funding_and_oi():
         oij = get_json(oi_url, {"instId": "BTC-USDT-SWAP"})
         data = oij.get("data", [])
         if data:
-            # OKX a veces trae varios; tomamos el primero
             oi = safe_float(data[0].get("oi"))
 
         source = "OKX"
@@ -156,73 +157,6 @@ def get_funding_and_oi():
         log(f"[WARN] OKX funding/OI failed: {repr(e)}")
 
     return None, None, "N/A"
-
-
-# ======================
-# DATA: Liquidaciones 24h (OKX) primero, Bybit fallback
-# (Porque OKX suele darlo más fácil desde hosting)
-# ======================
-def get_liquidations_24h_usd():
-    # --- OKX ---
-    try:
-        url = "https://www.okx.com/api/v5/public/liquidation-orders"
-        j = get_json(url, {"instId": "BTC-USDT-SWAP", "limit": 100})
-        data = j.get("data", [])
-        if not data:
-            log("[WARN] OKX liquidations empty.")
-        else:
-            now_ms = int(datetime.now(tz=TZ).timestamp() * 1000)
-            day_ms = 24 * 60 * 60 * 1000
-            total = 0.0
-            used = False
-            for e in data:
-                ts = int(e.get("ts", 0))
-                if now_ms - ts > day_ms:
-                    continue
-                # OKX trae "sz" (size) y a veces "bkPx" o "px"
-                sz = safe_float(e.get("sz"))
-                px = safe_float(e.get("bkPx")) or safe_float(e.get("px"))
-                if sz is None or px is None:
-                    continue
-                total += sz * px
-                used = True
-            if used:
-                return total, "OKX"
-    except Exception as e:
-        log(f"[WARN] OKX liquidations failed: {repr(e)}")
-
-    # --- Bybit fallback ---
-    try:
-        url = "https://api.bybit.com/v5/market/liquidation"
-        j = get_json(url, {"category": "linear", "symbol": "BTCUSDT", "limit": 200})
-        if j.get("retCode", 0) != 0:
-            raise RuntimeError(f"Bybit liquidation retCode={j.get('retCode')} retMsg={j.get('retMsg')}")
-        events = j.get("result", {}).get("list", [])
-        if not events:
-            log("[WARN] Bybit liquidations empty.")
-            return None, "Bybit"
-
-        now_ts = int(datetime.now(tz=TZ).timestamp() * 1000)
-        day_ms = 24 * 60 * 60 * 1000
-        total = 0.0
-        used = False
-
-        for e in events:
-            ts = int(e.get("time", 0))
-            if now_ts - ts > day_ms:
-                continue
-            qty = safe_float(e.get("qty"))
-            price = safe_float(e.get("price"))
-            if qty is None or price is None:
-                continue
-            total += qty * price
-            used = True
-
-        return (total if used else None), "Bybit"
-    except Exception as e:
-        log(f"[WARN] Bybit liquidations failed: {repr(e)}")
-
-    return None, "N/A"
 
 
 def get_fear_greed():
@@ -312,23 +246,19 @@ def build_report():
 
     price, chg_pct, vol_usd, ticker_src = get_ticker_24h()
     funding, oi, fo_src = get_funding_and_oi()
-    liq_24h, liq_src = get_liquidations_24h_usd()
-
     btc_dom, usdt_dom = get_dominance_btc_usdt()
     fng_val, fng_cls = get_fear_greed()
 
     bias, why = build_bias(chg_pct, funding, fng_val, usdt_dom)
 
-    # Logs de qué fuente se usó
-    log(f"[INFO] Ticker source: {ticker_src} | Funding/OI source: {fo_src} | Liq source: {liq_src}")
+    log(f"[INFO] Ticker source: {ticker_src} | Funding/OI source: {fo_src}")
 
     text = (
         f"Contexto de Mercado — {now}\n\n"
         f"BTC: ${fmt_money(price,0)} ({pct_arrow(chg_pct or 0)} {fmt_pct(chg_pct,2)} 24h)\n"
         f"Volumen 24h (USD): {fmt_money(vol_usd,0)}\n\n"
         f"Funding: {('No disponible' if funding is None else f'{funding:.4f}%')}\n"
-        f"Open Interest: {('No disponible' if oi is None else fmt_money(oi,0))}\n"
-        f"Liquidaciones 24h: {('No disponible' if liq_24h is None else f'${fmt_money(liq_24h,0)}')}\n\n"
+        f"Open Interest: {('No disponible' if oi is None else fmt_money(oi,0))}\n\n"
         f"BTC.D: {btc_dom:.2f}%\n"
         f"USDT.D (aprox): {usdt_dom:.2f}%\n"
         f"Fear & Greed: {fng_val} ({fng_cls})\n\n"
