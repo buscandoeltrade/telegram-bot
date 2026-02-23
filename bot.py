@@ -11,185 +11,151 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
-THREAD_ID = os.getenv("THREAD_ID", "").strip()  # opcional (topics)
+THREAD_ID = os.getenv("THREAD_ID", "").strip()  # opcional
+
+# Opcional: para mostrar Fear & Greed de Coinglass (si NO lo pones, no pasa nada)
+COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY", "").strip()
 
 TZ = pytz.timezone("Europe/Zurich")
-app = FastAPI(title="Telegram Market Bot")
-
-
-# ======================
-# Utils
-# ======================
-def log(msg: str):
-    print(msg, flush=True)
-
-def safe_float(x, default=None):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-def pct_arrow(x: float) -> str:
-    return "↑" if x > 0 else ("↓" if x < 0 else "→")
-
-def fmt_money(x: float, decimals=0):
-    if x is None:
-        return "No disponible"
-    return f"{x:,.{decimals}f}"
-
-def fmt_pct(x: float, decimals=2):
-    if x is None:
-        return "No disponible"
-    return f"{x:.{decimals}f}%"
-
+app = FastAPI(title="Telegram Market Context Bot")
 
 # ======================
-# HTTP helper
+# Data sources
 # ======================
-def get_json(url, params=None):
-    r = requests.get(
-        url,
-        params=params or {},
-        timeout=25,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
+def get_binance_btc_24h():
+    # Nota: en Railway a veces Binance bloquea por región/IP. Si te pasa, avísame y lo cambiamos a otro endpoint.
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    r = requests.get(url, params={"symbol": "BTCUSDT"}, timeout=20)
     r.raise_for_status()
-    return r.json()
+    j = r.json()
+    price = float(j["lastPrice"])
+    chg_pct = float(j["priceChangePercent"])
+    vol_usdt = float(j["quoteVolume"])
+    return price, chg_pct, vol_usdt
 
 
-# ======================
-# DATA: Ticker 24h (Bybit) con fallback OKX
-# ======================
-def get_ticker_24h():
-    # --- Bybit ---
-    try:
-        url = "https://api.bybit.com/v5/market/tickers"
-        j = get_json(url, {"category": "linear", "symbol": "BTCUSDT"})
-        if j.get("retCode", 0) != 0:
-            raise RuntimeError(f"Bybit ticker retCode={j.get('retCode')} retMsg={j.get('retMsg')}")
-        item = j["result"]["list"][0]
-        last = safe_float(item.get("lastPrice"))
-        chg_pct = safe_float(item.get("price24hPcnt"))
-        chg_pct = (chg_pct * 100) if chg_pct is not None else None
-        turnover = safe_float(item.get("turnover24h"))  # USD aprox
-        return last, chg_pct, turnover, "Bybit"
-    except Exception as e:
-        log(f"[WARN] Bybit ticker failed: {repr(e)}")
+def get_binance_funding_and_oi():
+    # Funding + Mark
+    purl = "https://fapi.binance.com/fapi/v1/premiumIndex"
+    pr = requests.get(purl, params={"symbol": "BTCUSDT"}, timeout=20)
+    pr.raise_for_status()
+    pj = pr.json()
+    funding = float(pj.get("lastFundingRate", 0.0))
+    mark = float(pj.get("markPrice", 0.0))
 
-    # --- OKX fallback ---
-    try:
-        url = "https://www.okx.com/api/v5/market/ticker"
-        j = get_json(url, {"instId": "BTC-USDT"})
-        data = j.get("data", [])
-        if not data:
-            raise RuntimeError("OKX ticker empty data")
-        item = data[0]
-        last = safe_float(item.get("last"))
-        open_24 = safe_float(item.get("open24h"))
-        chg_pct = None
-        if last is not None and open_24 not in (None, 0):
-            chg_pct = (last - open_24) / open_24 * 100
-        vol_ccy_24 = safe_float(item.get("volCcy24h"))  # en USDT aprox para BTC-USDT
-        return last, chg_pct, vol_ccy_24, "OKX"
-    except Exception as e:
-        log(f"[WARN] OKX ticker failed: {repr(e)}")
-
-    return None, None, None, "N/A"
+    # Open Interest
+    oiurl = "https://fapi.binance.com/fapi/v1/openInterest"
+    oir = requests.get(oiurl, params={"symbol": "BTCUSDT"}, timeout=20)
+    oir.raise_for_status()
+    oij = oir.json()
+    oi = float(oij.get("openInterest", 0.0))
+    return funding, mark, oi
 
 
-# ======================
-# DATA: Funding + OI (Bybit) con fallback OKX
-# ======================
-def get_funding_and_oi():
-    funding = None
-    oi = None
-    source = "N/A"
-
-    # --- Bybit ---
-    try:
-        # Funding
-        f_url = "https://api.bybit.com/v5/market/funding/history"
-        fj = get_json(f_url, {"category": "linear", "symbol": "BTCUSDT", "limit": 1})
-        if fj.get("retCode", 0) != 0:
-            raise RuntimeError(f"Bybit funding retCode={fj.get('retCode')} retMsg={fj.get('retMsg')}")
-        f_list = fj.get("result", {}).get("list", [])
-        if f_list:
-            fr = safe_float(f_list[0].get("fundingRate"))
-            funding = (fr * 100) if fr is not None else None
-
-        # OI
-        oi_url = "https://api.bybit.com/v5/market/open-interest"
-        oij = get_json(oi_url, {"category": "linear", "symbol": "BTCUSDT", "intervalTime": "5min", "limit": 1})
-        if oij.get("retCode", 0) != 0:
-            raise RuntimeError(f"Bybit OI retCode={oij.get('retCode')} retMsg={oij.get('retMsg')}")
-        oi_list = oij.get("result", {}).get("list", [])
-        if oi_list:
-            oi = safe_float(oi_list[0].get("openInterest"))
-
-        if funding is not None or oi is not None:
-            source = "Bybit"
-            return funding, oi, source
-
-        log("[WARN] Bybit funding/OI returned empty list(s).")
-    except Exception as e:
-        log(f"[WARN] Bybit funding/OI failed: {repr(e)}")
-
-    # --- OKX fallback ---
-    try:
-        # Funding rate OKX (swap)
-        f_url = "https://www.okx.com/api/v5/public/funding-rate"
-        fj = get_json(f_url, {"instId": "BTC-USDT-SWAP"})
-        data = fj.get("data", [])
-        if data:
-            fr = safe_float(data[0].get("fundingRate"))
-            funding = (fr * 100) if fr is not None else None
-
-        # OI OKX
-        oi_url = "https://www.okx.com/api/v5/public/open-interest"
-        oij = get_json(oi_url, {"instId": "BTC-USDT-SWAP"})
-        data = oij.get("data", [])
-        if data:
-            oi = safe_float(data[0].get("oi"))
-
-        source = "OKX"
-        return funding, oi, source
-    except Exception as e:
-        log(f"[WARN] OKX funding/OI failed: {repr(e)}")
-
-    return None, None, "N/A"
-
-
-def get_fear_greed():
+def get_fear_greed_alternative():
     url = "https://api.alternative.me/fng/"
-    j = get_json(url, {"limit": 1, "format": "json"})
+    r = requests.get(url, params={"limit": 1, "format": "json"}, timeout=20)
+    r.raise_for_status()
+    j = r.json()
     data = j["data"][0]
-    return int(data["value"]), data["value_classification"]
+    value = int(data["value"])
+    cls = data["value_classification"]
+    return value, cls
 
 
 def get_dominance_btc_usdt():
-    g = get_json("https://api.coingecko.com/api/v3/global")
-    gj = g["data"]
+    # CoinGecko global (BTC dominance) + USDT dominance aproximada
+    g = requests.get("https://api.coingecko.com/api/v3/global", timeout=20)
+    g.raise_for_status()
+    gj = g.json()["data"]
+
     btc_dom = float(gj["market_cap_percentage"].get("btc", 0.0))
     total_mcap = float(gj["total_market_cap"].get("usd", 0.0))
 
-    m = get_json(
+    # USDT market cap
+    m = requests.get(
         "https://api.coingecko.com/api/v3/coins/markets",
-        {"vs_currency": "usd", "ids": "tether"},
+        params={"vs_currency": "usd", "ids": "tether"},
+        timeout=20,
     )
-    usdt_mcap = float(m[0].get("market_cap", 0.0))
+    m.raise_for_status()
+    usdt_mcap = float(m.json()[0].get("market_cap", 0.0))
+
     usdt_dom = (usdt_mcap / total_mcap * 100) if total_mcap > 0 else 0.0
     return btc_dom, usdt_dom
 
 
+def get_coinglass_fng_optional():
+    """
+    Opcional.
+    Coinglass normalmente requiere API key.
+    Si NO tienes COINGLASS_API_KEY, regresamos None y NO rompemos nada.
+    """
+    if not COINGLASS_API_KEY:
+        return None
+
+    try:
+        # Endpoint típico (puede cambiar). Si falla, regresamos None sin romper el bot.
+        url = "https://open-api.coinglass.com/public/v2/index/fearGreed"
+        headers = {"coinglassSecret": COINGLASS_API_KEY}
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+
+        # Estructura común: {"code":"0","data":[{"value":14,...}]}
+        data = j.get("data")
+        if isinstance(data, list) and data:
+            val = data[0].get("value")
+            if val is not None:
+                return int(val)
+        return None
+    except Exception:
+        return None
+
+
 # ======================
-# Telegram
+# Smart conclusion (SMC-lite)
+# ======================
+def classify_environment(chg_pct_24h, fng_value, funding, usdt_dom):
+    """
+    Reglas simples (pero útiles) para tu reporte.
+    No intenta "predecir", solo clasificar contexto.
+    """
+
+    # thresholds
+    funding_pct = funding * 100.0  # funding en porcentaje
+    btc_red = chg_pct_24h < 0
+    fear_extreme = fng_value <= 10
+    greed_high = fng_value >= 70
+    usdt_high = usdt_dom >= 7.5  # ajustable
+
+    # 🔵 Acumulación probable (contrarian alcista)
+    # Miedo extremo + BTC en rojo + funding bajo/neutral + USDT.D alto (risk-off) => posible piso/absorción
+    if fear_extreme and btc_red and funding_pct <= 0.02 and usdt_high:
+        return "🔵 Acumulación probable", "Contrarian alcista (pánico/risk-off suele marcar zonas de oportunidad)"
+
+    # 🔴 Riesgo alto (euforia)
+    # Greed alto + funding elevado + USDT.D bajo => apalancamiento y euforia, riesgo de squeeze
+    if greed_high and funding_pct >= 0.05 and usdt_dom <= 6.0:
+        return "🔴 Riesgo alto", "Euforia + apalancamiento (riesgo de barrida/flush)"
+
+    # 🟡 Transición
+    return "🟡 Transición", "Contexto mixto (esperar confirmación / estructura)"
+
+
+# ======================
+# Telegram sender
 # ======================
 def send_telegram_message(text: str):
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("Faltan variables BOT_TOKEN o CHAT_ID")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
     if THREAD_ID:
         payload["message_thread_id"] = int(THREAD_ID)
 
@@ -197,74 +163,44 @@ def send_telegram_message(text: str):
     r.raise_for_status()
 
 
-# ======================
-# Bias
-# ======================
-def build_bias(chg_pct, funding, fng_val, usdt_dom):
-    notes = []
-    score = 0
-
-    if chg_pct is not None:
-        notes.append("BTC 24h en rojo" if chg_pct < 0 else "BTC 24h en verde")
-
-    if fng_val is not None:
-        if fng_val <= 10:
-            notes.append("Fear extremo (contrarian alcista)")
-            if chg_pct is not None and chg_pct < 0:
-                score += 1
-        elif fng_val >= 75:
-            notes.append("Greed alto (riesgo pullback)")
-            score -= 1
-
-    if funding is not None:
-        if funding > 0.02:
-            notes.append("Funding alto (riesgo squeeze bajista)")
-            score -= 1
-        elif funding < -0.02:
-            notes.append("Funding negativo (riesgo squeeze alcista)")
-            score += 1
-
-    if usdt_dom is not None and usdt_dom > 7.5:
-        notes.append("USDT.D elevado (presión risk-off)")
-        score -= 1
-
-    if score >= 1:
-        bias = "Leve Alcista"
-    elif score <= -1:
-        bias = "Leve Bajista"
-    else:
-        bias = "Neutral"
-
-    return bias, "; ".join(notes) if notes else "Sin suficientes señales"
-
-
-# ======================
-# Report
-# ======================
 def build_report():
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M (Suiza)")
 
-    price, chg_pct, vol_usd, ticker_src = get_ticker_24h()
-    funding, oi, fo_src = get_funding_and_oi()
+    price, chg_pct, vol_usdt = get_binance_btc_24h()
+    funding, mark, oi = get_binance_funding_and_oi()
+    fng_val, fng_cls = get_fear_greed_alternative()
     btc_dom, usdt_dom = get_dominance_btc_usdt()
-    fng_val, fng_cls = get_fear_greed()
 
-    bias, why = build_bias(chg_pct, funding, fng_val, usdt_dom)
+    # opcional coinglass
+    cg_fng = get_coinglass_fng_optional()
 
-    log(f"[INFO] Ticker source: {ticker_src} | Funding/OI source: {fo_src}")
+    # Clasificación smart money
+    env_label, env_reason = classify_environment(chg_pct, fng_val, funding, usdt_dom)
 
-    text = (
-        f"Contexto de Mercado — {now}\n\n"
-        f"BTC: ${fmt_money(price,0)} ({pct_arrow(chg_pct or 0)} {fmt_pct(chg_pct,2)} 24h)\n"
-        f"Volumen 24h (USD): {fmt_money(vol_usd,0)}\n\n"
-        f"Funding: {('No disponible' if funding is None else f'{funding:.4f}%')}\n"
-        f"Open Interest: {('No disponible' if oi is None else fmt_money(oi,0))}\n\n"
-        f"BTC.D: {btc_dom:.2f}%\n"
-        f"USDT.D (aprox): {usdt_dom:.2f}%\n"
-        f"Fear & Greed: {fng_val} ({fng_cls})\n\n"
-        f"Conclusión (BIAS): {bias} — {why}"
-    )
-    return text
+    # Formato
+    arrow = "↑" if chg_pct > 0 else ("↓" if chg_pct < 0 else "→")
+    funding_pct = funding * 100.0
+
+    lines = []
+    lines.append(f"Contexto de Mercado — {now}\n")
+    lines.append(f"BTC: ${price:,.0f} ({arrow} {chg_pct:.2f}% 24h)")
+    lines.append(f"Volumen 24h (USDT): {vol_usdt:,.0f}\n")
+
+    lines.append(f"Funding: {funding_pct:.4f}%")
+    lines.append(f"Open Interest: {oi:,.0f}\n")
+
+    lines.append(f"BTC.D: {btc_dom:.2f}%")
+    lines.append(f"USDT.D (aprox): {usdt_dom:.2f}%")
+
+    lines.append(f"Fear & Greed (Alternative): {fng_val} ({fng_cls})")
+    if cg_fng is not None:
+        lines.append(f"Fear & Greed (Coinglass): {cg_fng}")
+    lines.append("")
+
+    lines.append(f"Entorno (SM): {env_label}")
+    lines.append(f"Conclusión (BIAS): {env_reason}")
+
+    return "\n".join(lines)
 
 
 def job_send():
@@ -272,20 +208,23 @@ def job_send():
         msg = build_report()
         send_telegram_message(msg)
     except Exception as e:
-        log("ERROR job_send: " + repr(e))
+        print("ERROR job_send:", repr(e), flush=True)
 
 
 # ======================
-# Scheduler
+# Scheduler + FastAPI
 # ======================
 scheduler = BackgroundScheduler(timezone=TZ)
 
 @app.on_event("startup")
 def startup_event():
+    # 01:00 Suiza (Tokyo open según tu regla)
     scheduler.add_job(job_send, "cron", hour=1, minute=0, id="tokyo_1am", replace_existing=True)
+    # 09:00 Suiza (London open según tu regla)
     scheduler.add_job(job_send, "cron", hour=9, minute=0, id="london_9am", replace_existing=True)
+
     scheduler.start()
-    log("Scheduler started: 01:00 (Tokio), 09:00 (Londres) Europe/Zurich")
+    print("Scheduler started: 01:00 (Tokio), 09:00 (Londres) Europe/Zurich", flush=True)
 
 @app.get("/")
 def root():
